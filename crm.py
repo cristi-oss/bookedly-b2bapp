@@ -46,10 +46,7 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 _use_turso = bool(TURSO_URL and TURSO_TOKEN)
 
 if _use_turso:
-    try:
-        import libsql_experimental as libsql
-    except ImportError:
-        _use_turso = False
+    import requests as _requests
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
@@ -64,11 +61,63 @@ STAGES = ["new", "enriched", "contacted", "opened", "replied", "interested", "bo
 # DATABASE
 # ═══════════════════════════════════════════════════════════════════════
 
+def _turso_execute(sql: str, params: tuple = (), want_rows: bool = False):
+    """Execute SQL against Turso via HTTP API."""
+    url = TURSO_URL.replace("libsql://", "https://")
+    args = []
+    for p in params:
+        if isinstance(p, int):
+            args.append({"type": "integer", "value": str(p)})
+        elif isinstance(p, float):
+            args.append({"type": "float", "value": str(p)})
+        elif p is None:
+            args.append({"type": "null"})
+        else:
+            args.append({"type": "text", "value": str(p)})
+
+    body = {
+        "requests": [
+            {"type": "execute", "stmt": {"sql": sql, "args": args}},
+            {"type": "close"}
+        ]
+    }
+    resp = _requests.post(
+        f"{url}/v2/pipeline", json=body,
+        headers={"Authorization": f"Bearer {TURSO_TOKEN}"}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    result = data.get("results", [{}])[0]
+    if result.get("type") == "error":
+        raise Exception(result["error"].get("message", "Turso error"))
+
+    response = result.get("response", {}).get("result", {})
+
+    if want_rows:
+        cols = [c["name"] for c in response.get("cols", [])]
+        rows = []
+        for r in response.get("rows", []):
+            rows.append({cols[i]: cell.get("value") for i, cell in enumerate(r)})
+        return rows
+    return response.get("last_insert_rowid", None)
+
+
+def _turso_batch(statements: list[str]):
+    """Execute multiple SQL statements against Turso."""
+    url = TURSO_URL.replace("libsql://", "https://")
+    reqs = [{"type": "execute", "stmt": {"sql": s}} for s in statements]
+    reqs.append({"type": "close"})
+    resp = _requests.post(
+        f"{url}/v2/pipeline", json={"requests": reqs},
+        headers={"Authorization": f"Bearer {TURSO_TOKEN}"}
+    )
+    resp.raise_for_status()
+
+
 def get_conn():
     if _use_turso:
-        conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return None  # Turso uses HTTP, no persistent connection
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -76,6 +125,8 @@ def get_conn():
 
 
 def query(sql: str, params: tuple = ()) -> list[dict]:
+    if _use_turso:
+        return _turso_execute(sql, params, want_rows=True)
     conn = get_conn()
     try:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -84,6 +135,12 @@ def query(sql: str, params: tuple = ()) -> list[dict]:
 
 
 def scalar(sql: str, params: tuple = (), default=0):
+    if _use_turso:
+        rows = _turso_execute(sql, params, want_rows=True)
+        if rows:
+            first_val = list(rows[0].values())[0]
+            return first_val if first_val is not None else default
+        return default
     conn = get_conn()
     try:
         row = conn.execute(sql, params).fetchone()
@@ -93,6 +150,8 @@ def scalar(sql: str, params: tuple = (), default=0):
 
 
 def execute(sql: str, params: tuple = ()):
+    if _use_turso:
+        return _turso_execute(sql, params)
     conn = get_conn()
     try:
         conn.execute(sql, params)
@@ -103,63 +162,72 @@ def execute(sql: str, params: tuple = ()):
 
 def init_crm():
     """Create CRM tables and migrate leads table."""
-    conn = get_conn()
+    table_stmts = [
+        """CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_name TEXT, phone TEXT, website TEXT, address TEXT,
+            city TEXT, state TEXT, niche TEXT, rating REAL, reviews INTEGER,
+            email TEXT, email_status TEXT, decision_maker TEXT, dm_title TEXT,
+            lead_stage TEXT DEFAULT 'new', instantly_campaign_id TEXT,
+            email_sent_at TEXT, email_opened_at TEXT, email_replied_at TEXT,
+            email_bounced INTEGER DEFAULT 0, reply_text TEXT,
+            has_facebook_ads INTEGER DEFAULT 0, ad_spend_estimate TEXT,
+            outreach_angle TEXT, angle_type TEXT, personalized_line TEXT,
+            scrape_date TEXT, source TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+            name TEXT NOT NULL, role TEXT DEFAULT 'viewer', created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL, user_id INTEGER, note_text TEXT NOT NULL,
+            created_at TEXT NOT NULL, FOREIGN KEY (lead_id) REFERENCES leads(id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL, tag_name TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads(id), UNIQUE(lead_id, tag_name)
+        )""",
+        """CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER, action TEXT NOT NULL, details TEXT,
+            user_id INTEGER, created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT NOT NULL, run_type TEXT NOT NULL, status TEXT DEFAULT 'running',
+            state_name TEXT, niches TEXT,
+            leads_scraped INTEGER DEFAULT 0, leads_enriched INTEGER DEFAULT 0,
+            emails_found INTEGER DEFAULT 0, emails_verified INTEGER DEFAULT 0,
+            ads_checked INTEGER DEFAULT 0, angles_generated INTEGER DEFAULT 0,
+            csvs_exported INTEGER DEFAULT 0, leads_uploaded INTEGER DEFAULT 0,
+            errors TEXT, duration_sec REAL, details TEXT,
+            started_at TEXT NOT NULL, finished_at TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_date ON pipeline_runs(run_date)",
+        "CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads(lead_stage)",
+        "CREATE INDEX IF NOT EXISTS idx_notes_lead ON notes(lead_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tags_lead ON tags(lead_id)",
+        "CREATE INDEX IF NOT EXISTS idx_activity_lead ON activity_log(lead_id)",
+    ]
 
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            name TEXT NOT NULL,
-            role TEXT DEFAULT 'viewer',
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lead_id INTEGER NOT NULL,
-            user_id INTEGER,
-            note_text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (lead_id) REFERENCES leads(id)
-        );
-        CREATE TABLE IF NOT EXISTS tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lead_id INTEGER NOT NULL,
-            tag_name TEXT NOT NULL,
-            FOREIGN KEY (lead_id) REFERENCES leads(id),
-            UNIQUE(lead_id, tag_name)
-        );
-        CREATE TABLE IF NOT EXISTS activity_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lead_id INTEGER,
-            action TEXT NOT NULL,
-            details TEXT,
-            user_id INTEGER,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pipeline_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_date TEXT NOT NULL,
-            run_type TEXT NOT NULL,
-            status TEXT DEFAULT 'running',
-            state_name TEXT,
-            niches TEXT,
-            leads_scraped INTEGER DEFAULT 0,
-            leads_enriched INTEGER DEFAULT 0,
-            emails_found INTEGER DEFAULT 0,
-            emails_verified INTEGER DEFAULT 0,
-            ads_checked INTEGER DEFAULT 0,
-            angles_generated INTEGER DEFAULT 0,
-            csvs_exported INTEGER DEFAULT 0,
-            leads_uploaded INTEGER DEFAULT 0,
-            errors TEXT,
-            duration_sec REAL,
-            details TEXT,
-            started_at TEXT NOT NULL,
-            finished_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_pipeline_runs_date ON pipeline_runs(run_date);
-    """)
+    if _use_turso:
+        _turso_batch(table_stmts)
+        # Check if admin exists
+        users = _turso_execute("SELECT COUNT(*) as cnt FROM users", (), want_rows=True)
+        if not users or int(users[0].get("cnt", 0)) == 0:
+            _turso_execute(
+                "INSERT INTO users (email, password_hash, name, role, created_at) VALUES (?,?,?,?,?)",
+                ("admin@bookedly.com", generate_password_hash("bookedly", method="pbkdf2:sha256"),
+                 "Admin", "admin", datetime.utcnow().isoformat()),
+            )
+            print("[crm] Created default admin: admin@bookedly.com / bookedly")
+        return
+
+    conn = get_conn()
+    conn.executescript("; ".join(table_stmts))
 
     # Migrate leads table — add CRM columns if missing
     existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
@@ -176,12 +244,6 @@ def init_crm():
         if col not in existing:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {col_type}")
 
-    conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads(lead_stage);
-        CREATE INDEX IF NOT EXISTS idx_notes_lead ON notes(lead_id);
-        CREATE INDEX IF NOT EXISTS idx_tags_lead ON tags(lead_id);
-        CREATE INDEX IF NOT EXISTS idx_activity_lead ON activity_log(lead_id);
-    """)
     conn.commit()
 
     # Default admin user

@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+leads_*.csv
+storage/
+.DS_Store
+.vercel/

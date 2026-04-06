@@ -139,7 +139,14 @@ def scalar(sql: str, params: tuple = (), default=0):
         rows = _turso_execute(sql, params, want_rows=True)
         if rows:
             first_val = list(rows[0].values())[0]
-            return first_val if first_val is not None else default
+            if first_val is None:
+                return default
+            if isinstance(default, (int, float)):
+                try:
+                    return type(default)(first_val)
+                except (ValueError, TypeError):
+                    return default
+            return first_val
         return default
     conn = get_conn()
     try:
@@ -165,15 +172,19 @@ def init_crm():
     table_stmts = [
         """CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            business_name TEXT, phone TEXT, website TEXT, address TEXT,
-            city TEXT, state TEXT, niche TEXT, rating REAL, reviews INTEGER,
-            email TEXT, email_status TEXT, decision_maker TEXT, dm_title TEXT,
-            lead_stage TEXT DEFAULT 'new', instantly_campaign_id TEXT,
-            email_sent_at TEXT, email_opened_at TEXT, email_replied_at TEXT,
-            email_bounced INTEGER DEFAULT 0, reply_text TEXT,
-            has_facebook_ads INTEGER DEFAULT 0, ad_spend_estimate TEXT,
-            outreach_angle TEXT, angle_type TEXT, personalized_line TEXT,
-            scrape_date TEXT, source TEXT
+            name TEXT, phone TEXT, website TEXT, address TEXT, city TEXT, state TEXT,
+            rating REAL, review_count INTEGER, category TEXT, place_id TEXT,
+            decision_maker_name TEXT, decision_maker_title TEXT,
+            email TEXT, email_type TEXT, email_confidence TEXT, email_method TEXT,
+            scraped_at TEXT, delivered_at TEXT, source TEXT, niche TEXT,
+            has_facebook_ads INTEGER DEFAULT 0, facebook_ad_count INTEGER,
+            facebook_ad_samples TEXT, ad_analysis TEXT,
+            outreach_angle TEXT, angle_type TEXT,
+            email_verified TEXT, email_verify_status TEXT,
+            lead_stage TEXT DEFAULT 'new',
+            instantly_campaign_id TEXT, email_sent_at TEXT, email_opened_at TEXT,
+            email_replied_at TEXT, email_bounced INTEGER DEFAULT 0, reply_text TEXT,
+            subject_line TEXT
         )""",
         """CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,7 +278,7 @@ def current_user():
     uid = session.get("user_id")
     if not uid:
         return None
-    rows = query("SELECT * FROM users WHERE id = ?", (uid,))
+    rows = query("SELECT * FROM users WHERE id = ?", (int(uid),))
     return rows[0] if rows else None
 
 
@@ -1622,7 +1633,7 @@ def login():
         req_email = email
         rows = query("SELECT * FROM users WHERE LOWER(email) = ?", (email,))
         if rows and check_password_hash(rows[0]["password_hash"], password):
-            session["user_id"] = rows[0]["id"]
+            session["user_id"] = int(rows[0]["id"])
             return redirect(url_for("pipeline"))
         error = "Invalid email or password"
     return render_template_string(LOGIN_PAGE, title="Login", error=error, req_email=req_email)
